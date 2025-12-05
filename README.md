@@ -1,6 +1,8 @@
 # twitterapi-docs-mcp
 
 [![npm version](https://img.shields.io/npm/v/twitterapi-docs-mcp.svg)](https://www.npmjs.com/package/twitterapi-docs-mcp)
+[![npm downloads](https://img.shields.io/npm/dm/twitterapi-docs-mcp.svg)](https://www.npmjs.com/package/twitterapi-docs-mcp)
+[![MCP Registry](https://img.shields.io/badge/MCP-Registry-blue?logo=anthropic)](https://registry.modelcontextprotocol.io)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D18.18.0-brightgreen.svg)](https://nodejs.org/)
 
