@@ -9,7 +9,7 @@
   },
   "scripts": {
     "start": "node index.js",
-    "test": "node --test 'test/**/*.test.js'",
+    "test": "node --test test/index.test.js",
     "scrape": "node scrape-all.cjs",
     "prepublishOnly": "npm test"
   },
