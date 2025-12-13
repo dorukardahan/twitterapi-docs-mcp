@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.5] - 2025-12-13
+
+### Added
+- `context7.json` for Context7 library ownership claim
+- `get_twitterapi_url` tool to fetch any `twitterapi.io` / `docs.twitterapi.io` URL (snapshot-first, optional live fetch)
+- Expanded snapshot coverage via `sitemap.xml` + blog index crawl (site pages + more blog posts)
+- Additional resource aliases (`twitterapi://endpoints/list`, `twitterapi://status/freshness`)
+- MCP protocol integration test to prevent `outputSchema` regressions
+
+### Fixed
+- MCP SDK compatibility: tools now return `structuredContent` when `outputSchema` is declared
+- Scraper redirect handling for relative `Location` headers
+
+### Changed
+- `get_twitterapi_guide` now validates against dynamic page keys from `data/docs.json`
+
+---
+
 ## [1.0.4] - 2025-12-05
 
 ### Added

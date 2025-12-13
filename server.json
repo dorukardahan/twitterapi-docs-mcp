@@ -1,17 +1,17 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-10-17/server.schema.json",
   "name": "io.github.dorukardahan/twitterapi-docs-mcp",
-  "description": "Offline access to TwitterAPI.io docs for AI assistants. 52 endpoints, guides, pricing.",
+  "description": "Offline access to TwitterAPI.io docs for AI assistants. 52 endpoints, pages, blog posts.",
   "repository": {
     "url": "https://github.com/dorukardahan/twitterapi-docs-mcp",
     "source": "github"
   },
-  "version": "1.0.3",
+  "version": "1.0.5",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "twitterapi-docs-mcp",
-      "version": "1.0.3",
+      "version": "1.0.5",
       "transport": {
         "type": "stdio"
       }

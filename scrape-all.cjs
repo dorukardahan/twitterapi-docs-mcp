@@ -1,63 +1,49 @@
 #!/usr/bin/env node
 /**
- * TwitterAPI.io Complete Documentation Scraper v2.0
+ * TwitterAPI.io Complete Documentation Scraper v2.1
  * Düzeltmeler:
  * - Path extraction bug fix (cURL'den doğru path çıkarma)
  * - İçerik truncation kaldırıldı
  * - Daha iyi parameter parsing
+ * - Sitemap + blog index ile otomatik link keşfi
  */
 
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
 
-// Ana site sayfaları
-const MAIN_SITE_PAGES = [
-  { url: 'https://twitterapi.io/pricing', name: 'pricing', category: 'guide' },
-  { url: 'https://twitterapi.io/qps-limits', name: 'qps_limits', category: 'guide' },
-  { url: 'https://twitterapi.io/tweet-filter-rules', name: 'tweet_filter_rules', category: 'guide' },
-  { url: 'https://twitterapi.io/changelog', name: 'changelog', category: 'guide' },
-  { url: 'https://twitterapi.io/readme', name: 'readme', category: 'guide' },
-  { url: 'https://twitterapi.io/affiliate-program', name: 'affiliate_program', category: 'info' },
-  { url: 'https://twitterapi.io/buy-twitter-accounts', name: 'buy_twitter_accounts', category: 'info' },
-  { url: 'https://twitterapi.io/twitter-stream', name: 'twitter_stream', category: 'guide' },
-  { url: 'https://twitterapi.io/blog/twitter-api-pricing-2025', name: 'blog_pricing_2025', category: 'blog' },
-  { url: 'https://twitterapi.io/blog/twitter-analytics-api-guide', name: 'blog_analytics_guide', category: 'blog' },
-  { url: 'https://twitterapi.io/blog/apify-alternative-for-twitter', name: 'blog_apify_alternative', category: 'blog' },
-  { url: 'https://twitterapi.io/blog/build-twitter-apps-with-kiro-ai-ide', name: 'blog_kiro_ai', category: 'blog' },
-  { url: 'https://twitterapi.io/blog/resources-and-tools', name: 'blog_resources', category: 'blog' },
-  { url: 'https://twitterapi.io/blog/how-to-monitor-twitter-accounts-for-new-tweets-in-real-time', name: 'blog_monitor_tweets', category: 'blog' },
-];
+const SITE_SITEMAP_URL = 'https://twitterapi.io/sitemap.xml';
+const BLOG_INDEX_URL = 'https://twitterapi.io/blog/';
+const DOCS_SITEMAP_URL = 'https://docs.twitterapi.io/sitemap.xml';
+const DOCS_ENDPOINT_PREFIX = 'https://docs.twitterapi.io/api-reference/endpoint/';
 
-// API Endpoint'leri (docs.twitterapi.io)
-const API_ENDPOINTS = [
-  'get_user_by_username', 'batch_get_user_by_userids', 'get_user_last_tweets',
-  'get_user_followers', 'get_user_followings', 'get_user_mention',
-  'get_user_verified_followers', 'check_follow_relationship', 'search_user',
-  'get_tweet_by_ids', 'get_tweet_reply', 'get_tweet_quote', 'get_tweet_retweeter',
-  'get_tweet_thread_context', 'get_article', 'tweet_advanced_search',
-  'get_list_followers', 'get_list_members',
-  'get_community_by_id', 'get_community_members', 'get_community_moderators',
-  'get_community_tweets', 'get_all_community_tweets',
-  'get_trends', 'get_my_info',
-  'user_login_v2', 'login_by_email_or_username', 'login_by_2fa',
-  'upload_media_v2', 'upload_tweet_image',
-  'create_tweet', 'create_tweet_v2', 'delete_tweet_v2',
-  'send_dm_v2', 'get_dm_history_by_user_id',
-  'retweet_tweet', 'retweet_tweet_v2',
-  'like_tweet', 'like_tweet_v2', 'unlike_tweet_v2',
-  'follow_user_v2', 'unfollow_user_v2',
-  'create_community_v2', 'delete_community_v2', 'join_community_v2', 'leave_community_v2',
-  'add_webhook_rule', 'get_webhook_rules', 'update_webhook_rule', 'delete_webhook_rule',
-  'add_user_to_monitor_tweet', 'remove_user_to_monitor_tweet'
-];
+const GUIDE_PAGE_KEYS = new Set([
+  'pricing',
+  'qps_limits',
+  'tweet_filter_rules',
+  'changelog',
+  'readme',
+  'twitter_stream',
+  'introduction',
+  'authentication',
+]);
+
+const BLOG_KEY_OVERRIDES = new Map([
+  ['twitter-api-pricing-2025', 'blog_pricing_2025'],
+  ['twitter-analytics-api-guide', 'blog_analytics_guide'],
+  ['apify-alternative-for-twitter', 'blog_apify_alternative'],
+  ['build-twitter-apps-with-kiro-ai-ide', 'blog_kiro_ai'],
+  ['resources-and-tools', 'blog_resources'],
+  ['how-to-monitor-twitter-accounts-for-new-tweets-in-real-time', 'blog_monitor_tweets'],
+]);
 
 function fetchPage(url) {
   return new Promise((resolve, reject) => {
     const client = url.startsWith('https') ? https : require('http');
     client.get(url, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        return fetchPage(res.headers.location).then(resolve).catch(reject);
+        const redirectedUrl = new URL(res.headers.location, url).toString();
+        return fetchPage(redirectedUrl).then(resolve).catch(reject);
       }
       let data = '';
       res.on('data', chunk => data += chunk);
@@ -77,6 +63,127 @@ function decodeHtmlEntities(text) {
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
     .replace(/&#39;/g, "'");
+}
+
+function extractSitemapLocs(xml) {
+  return [...xml.matchAll(/<loc>([^<]+)<\/loc>/g)]
+    .map(m => m[1].trim())
+    .filter(Boolean);
+}
+
+function normalizeKey(input) {
+  return input
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .replace(/_+/g, '_');
+}
+
+function stripSlashes(value) {
+  return value.replace(/^\/+|\/+$/g, '');
+}
+
+function pageKeyFromUrl(url) {
+  const { pathname } = new URL(url);
+  const clean = stripSlashes(pathname);
+  if (!clean) return 'home';
+  if (clean === 'blog') return 'blog_index';
+  return normalizeKey(clean.replace(/\//g, '_'));
+}
+
+function blogKeyFromUrl(url) {
+  const { pathname } = new URL(url);
+  const clean = stripSlashes(pathname);
+  if (!clean || clean === 'blog') return 'blog_index';
+
+  const slug = clean.startsWith('blog/') ? clean.slice('blog/'.length) : clean;
+  const override = BLOG_KEY_OVERRIDES.get(slug);
+  if (override) return override;
+
+  return `blog_${normalizeKey(slug)}`;
+}
+
+function categoryForPageKey(key, host) {
+  if (host === 'docs.twitterapi.io') return 'docs';
+  if (key === 'blog_index') return 'blog';
+  if (GUIDE_PAGE_KEYS.has(key)) return 'guide';
+  return 'info';
+}
+
+function discoverBlogUrlsFromIndex(html) {
+  const urls = new Set();
+  const matches = html.matchAll(/href=["'](\/blog\/[^"'?#]+)\/?["']/gi);
+  for (const m of matches) {
+    const path = m[1].replace(/\/+$/g, '');
+    if (path === '/blog') continue;
+    urls.add(`https://twitterapi.io${path}`);
+  }
+  return [...urls];
+}
+
+async function discoverScrapeTargets() {
+  // twitterapi.io (marketing + blog)
+  const siteXml = await fetchPage(SITE_SITEMAP_URL);
+  const siteUrls = new Set(extractSitemapLocs(siteXml));
+
+  // Blog index often contains more posts than sitemap
+  try {
+    const blogIndexHtml = await fetchPage(BLOG_INDEX_URL);
+    for (const u of discoverBlogUrlsFromIndex(blogIndexHtml)) {
+      siteUrls.add(u);
+    }
+  } catch (_err) {
+    // Non-fatal: fall back to sitemap + overrides
+  }
+
+  // Ensure legacy/known posts remain included even if not discoverable
+  for (const slug of BLOG_KEY_OVERRIDES.keys()) {
+    siteUrls.add(`https://twitterapi.io/blog/${slug}`);
+  }
+
+  const sitePages = [];
+  const siteBlogs = [];
+  for (const u of siteUrls) {
+    const parsed = new URL(u);
+    if (parsed.hostname !== 'twitterapi.io') continue;
+
+    const isBlogPost = parsed.pathname.startsWith('/blog/')
+      && parsed.pathname !== '/blog/'
+      && parsed.pathname !== '/blog';
+
+    if (isBlogPost) {
+      const name = blogKeyFromUrl(u);
+      siteBlogs.push({ url: u, name, category: 'blog' });
+    } else {
+      const name = pageKeyFromUrl(u);
+      sitePages.push({ url: u, name, category: categoryForPageKey(name, parsed.hostname) });
+    }
+  }
+
+  // docs.twitterapi.io (API reference + docs pages)
+  const docsXml = await fetchPage(DOCS_SITEMAP_URL);
+  const docsUrls = extractSitemapLocs(docsXml);
+
+  const endpoints = [];
+  const docsPages = [];
+  for (const u of docsUrls) {
+    if (!u.startsWith('https://docs.twitterapi.io/')) continue;
+    if (u.startsWith(DOCS_ENDPOINT_PREFIX)) {
+      const slug = u.slice(DOCS_ENDPOINT_PREFIX.length).replace(/\/+$/g, '');
+      if (slug) endpoints.push(slug);
+    } else {
+      const name = pageKeyFromUrl(u);
+      docsPages.push({ url: u, name, category: 'docs' });
+    }
+  }
+
+  // Stable ordering
+  sitePages.sort((a, b) => a.name.localeCompare(b.name));
+  siteBlogs.sort((a, b) => a.name.localeCompare(b.name));
+  docsPages.sort((a, b) => a.name.localeCompare(b.name));
+  endpoints.sort();
+
+  return { sitePages, siteBlogs, docsPages, endpoints };
 }
 
 function extractMainSiteContent(html, pageName) {
@@ -288,15 +395,23 @@ function extractEndpointContent(html, endpointName) {
 }
 
 async function scrapeAll() {
-  console.log('🚀 TwitterAPI.io v2.0 Scraper - Tüm içerikler çekiliyor...\n');
+  console.log('🚀 TwitterAPI.io v2.1 Scraper - Tüm içerikler çekiliyor...\n');
+
+  console.log('🔎 Link keşfi (sitemap + blog index)...\n');
+  const targets = await discoverScrapeTargets();
+
+  const pagesToScrape = [...targets.sitePages, ...targets.docsPages];
+  const blogsToScrape = targets.siteBlogs;
+  const endpointsToScrape = targets.endpoints;
 
   const docs = {
     meta: {
       source: 'https://twitterapi.io + https://docs.twitterapi.io',
       scraped_at: new Date().toISOString(),
-      version: '2.0',
-      total_endpoints: API_ENDPOINTS.length,
-      total_pages: MAIN_SITE_PAGES.length
+      version: '2.1',
+      total_endpoints: endpointsToScrape.length,
+      total_pages: pagesToScrape.length,
+      total_blogs: blogsToScrape.length
     },
     authentication: {
       header: 'x-api-key',
@@ -328,21 +443,15 @@ async function scrapeAll() {
     blogs: {}
   };
 
-  // 1. Ana site sayfalarını çek
-  console.log('📄 Ana site sayfaları çekiliyor...\n');
-  for (const page of MAIN_SITE_PAGES) {
+  console.log(`📄 Sayfalar çekiliyor... (${pagesToScrape.length})\n`);
+  for (const page of pagesToScrape) {
     process.stdout.write(`  ${page.name}... `);
     try {
       const html = await fetchPage(page.url);
       const content = extractMainSiteContent(html, page.name);
       content.url = page.url;
       content.category = page.category;
-
-      if (page.category === 'blog') {
-        docs.blogs[page.name] = content;
-      } else {
-        docs.pages[page.name] = content;
-      }
+      docs.pages[page.name] = content;
       console.log('✅');
     } catch (err) {
       console.log('❌', err.message);
@@ -350,9 +459,24 @@ async function scrapeAll() {
     await new Promise(r => setTimeout(r, 200));
   }
 
-  // 2. API Endpoint dokümanlarını çek
-  console.log('\n📚 API Endpoint dokümanları çekiliyor...\n');
-  for (const endpoint of API_ENDPOINTS) {
+  console.log(`\n📰 Blog yazıları çekiliyor... (${blogsToScrape.length})\n`);
+  for (const blog of blogsToScrape) {
+    process.stdout.write(`  ${blog.name}... `);
+    try {
+      const html = await fetchPage(blog.url);
+      const content = extractMainSiteContent(html, blog.name);
+      content.url = blog.url;
+      content.category = 'blog';
+      docs.blogs[blog.name] = content;
+      console.log('✅');
+    } catch (err) {
+      console.log('❌', err.message);
+    }
+    await new Promise(r => setTimeout(r, 200));
+  }
+
+  console.log(`\n📚 API Endpoint dokümanları çekiliyor... (${endpointsToScrape.length})\n`);
+  for (const endpoint of endpointsToScrape) {
     const url = `https://docs.twitterapi.io/api-reference/endpoint/${endpoint}`;
     process.stdout.write(`  ${endpoint}... `);
     try {
@@ -366,28 +490,6 @@ async function scrapeAll() {
     await new Promise(r => setTimeout(r, 150));
   }
 
-  // 3. Giriş ve Authentication sayfalarını çek
-  console.log('\n📖 Temel dokümanlar çekiliyor...\n');
-  const basicDocs = [
-    { url: 'https://docs.twitterapi.io/introduction', name: 'introduction' },
-    { url: 'https://docs.twitterapi.io/authentication', name: 'authentication' }
-  ];
-
-  for (const doc of basicDocs) {
-    process.stdout.write(`  ${doc.name}... `);
-    try {
-      const html = await fetchPage(doc.url);
-      docs.pages[doc.name] = extractMainSiteContent(html, doc.name);
-      docs.pages[doc.name].url = doc.url;
-      docs.pages[doc.name].category = 'docs';
-      console.log('✅');
-    } catch (err) {
-      console.log('❌', err.message);
-    }
-    await new Promise(r => setTimeout(r, 200));
-  }
-
-  // Kaydet
   const outPath = path.join(__dirname, 'data', 'docs.json');
   fs.mkdirSync(path.dirname(outPath), { recursive: true });
   fs.writeFileSync(outPath, JSON.stringify(docs, null, 2));
@@ -399,7 +501,7 @@ async function scrapeAll() {
   };
 
   console.log(`
-✅ Scraping tamamlandı! (v2.0)
+✅ Scraping tamamlandı! (v2.1)
    - ${stats.endpoints} endpoint
    - ${stats.pages} sayfa
    - ${stats.blogs} blog yazısı

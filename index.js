@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * TwitterAPI.io Documentation MCP Server v1.0.3
+ * TwitterAPI.io Documentation MCP Server v1.0.5
  *
  * Production-ready MCP server with:
  * - Comprehensive error handling with ErrorType classification
@@ -69,11 +69,17 @@ function formatToolError(error) {
   };
 }
 
-function formatToolSuccess(text) {
-  return {
+function formatToolSuccess(text, structuredContent) {
+  const result = {
     content: [{ type: 'text', text }],
     isError: false
   };
+
+  if (structuredContent !== undefined) {
+    result.structuredContent = structuredContent;
+  }
+
+  return result;
 }
 
 // ========== STRUCTURED LOGGING ==========
@@ -91,7 +97,8 @@ const SLO = {
   list_twitterapi_endpoints: { target: 5, acceptable: 20, alert: 50 },
   get_twitterapi_guide: { target: 10, acceptable: 50, alert: 100 },
   get_twitterapi_pricing: { target: 5, acceptable: 20, alert: 50 },
-  get_twitterapi_auth: { target: 5, acceptable: 20, alert: 50 }
+  get_twitterapi_auth: { target: 5, acceptable: 20, alert: 50 },
+  get_twitterapi_url: { target: 20, acceptable: 200, alert: 1000 }
 };
 
 class Logger {
@@ -437,6 +444,11 @@ const endpointCache = new HybridCache('endpoints', {
   ttl: 24 * 60 * 60 * 1000,  // 24 hours for endpoints
   diskWriteProbability: 1.0  // Always write to disk for stdio MCP
 });
+const urlCache = new HybridCache('urls', {
+  maxEntries: 200,
+  ttl: 24 * 60 * 60 * 1000,  // 24 hours for URL lookups
+  diskWriteProbability: 1.0  // Always write to disk for stdio MCP
+});
 
 // Periodic cleanup (every hour)
 let cleanupInterval = null;
@@ -445,6 +457,7 @@ function startCacheCleanup() {
   cleanupInterval = setInterval(() => {
     searchCache.cleanup();
     endpointCache.cleanup();
+    urlCache.cleanup();
   }, 60 * 60 * 1000); // 1 hour
 }
 
@@ -458,7 +471,8 @@ function stopCacheCleanup() {
 function getAllCacheStats() {
   return {
     search: searchCache.stats(),
-    endpoints: endpointCache.stats()
+    endpoints: endpointCache.stats(),
+    urls: urlCache.stats()
   };
 }
 
@@ -543,14 +557,14 @@ function validateEndpointName(name) {
   return { valid: true, value: trimmed };
 }
 
-function validateGuideName(name) {
+function validateGuideName(name, availableGuideNames = VALIDATION.GUIDE_NAMES) {
   if (!name || typeof name !== 'string') {
     return {
       valid: false,
       error: {
         type: ErrorType.INPUT_VALIDATION,
         message: 'Guide name cannot be empty',
-        suggestion: `Available guides: ${VALIDATION.GUIDE_NAMES.join(', ')}`,
+        suggestion: `Available guides: ${availableGuideNames.join(', ')}`,
         retryable: false
       }
     };
@@ -558,13 +572,13 @@ function validateGuideName(name) {
 
   const trimmed = name.trim().toLowerCase();
 
-  if (!VALIDATION.GUIDE_NAMES.includes(trimmed)) {
+  if (!availableGuideNames.includes(trimmed)) {
     return {
       valid: false,
       error: {
         type: ErrorType.INPUT_VALIDATION,
         message: `Unknown guide: "${trimmed}"`,
-        suggestion: `Available guides: ${VALIDATION.GUIDE_NAMES.join(', ')}`,
+        suggestion: `Available guides: ${availableGuideNames.join(', ')}`,
         retryable: false
       }
     };
@@ -593,6 +607,73 @@ function validateCategory(category) {
   }
 
   return { valid: true, value: trimmed };
+}
+
+const ALLOWED_URL_HOSTS = new Set(['twitterapi.io', 'docs.twitterapi.io']);
+
+function canonicalizeUrl(rawUrl) {
+  const trimmed = rawUrl.trim();
+  if (!trimmed) throw new Error('URL cannot be empty');
+
+  let candidate = trimmed;
+  if (candidate.startsWith('/')) {
+    candidate = `https://twitterapi.io${candidate}`;
+  } else if (/^(twitterapi\.io|docs\.twitterapi\.io)\//i.test(candidate)) {
+    candidate = `https://${candidate}`;
+  }
+
+  const u = new URL(candidate);
+  if (u.protocol !== 'https:') {
+    throw new Error('Only https URLs are supported');
+  }
+  if (!ALLOWED_URL_HOSTS.has(u.hostname)) {
+    throw new Error(`Unsupported host: ${u.hostname}`);
+  }
+
+  // Ignore fragments and common tracking/query params for matching
+  u.hash = '';
+  u.search = '';
+  if (u.pathname !== '/' && u.pathname.endsWith('/')) {
+    u.pathname = u.pathname.slice(0, -1);
+  }
+
+  return u.toString();
+}
+
+function normalizeKeyForName(input) {
+  return input
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .replace(/_+/g, '_');
+}
+
+function validateTwitterApiUrl(url) {
+  if (!url || typeof url !== 'string') {
+    return {
+      valid: false,
+      error: {
+        type: ErrorType.INPUT_VALIDATION,
+        message: 'URL cannot be empty',
+        suggestion: 'Provide a full URL like https://twitterapi.io/pricing or https://docs.twitterapi.io/introduction',
+        retryable: false
+      }
+    };
+  }
+
+  try {
+    return { valid: true, value: canonicalizeUrl(url) };
+  } catch (err) {
+    return {
+      valid: false,
+      error: {
+        type: ErrorType.INPUT_VALIDATION,
+        message: `Invalid URL: ${err.message}`,
+        suggestion: 'Only https://twitterapi.io/* and https://docs.twitterapi.io/* URLs are supported',
+        retryable: false
+      }
+    };
+  }
 }
 
 // ========== DATA LOADING ==========
@@ -875,11 +956,173 @@ function searchInDocs(query, maxResults = 20) {
   return results.sort((a, b) => b.score - a.score).slice(0, maxResults);
 }
 
+function decodeHtmlEntities(text) {
+  return text
+    .replace(/&#x3C;/g, '<')
+    .replace(/&#x3E;/g, '>')
+    .replace(/&#x27;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, ' ');
+}
+
+function extractHtmlContent(html) {
+  const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
+  const title = titleMatch ? decodeHtmlEntities(titleMatch[1].trim()) : '';
+
+  const descMatch = html.match(/<meta[^>]*name="description"[^>]*content="([^"]+)"/i);
+  const description = descMatch ? decodeHtmlEntities(descMatch[1].trim()) : '';
+
+  const headers = [];
+  for (const m of html.matchAll(/<h([1-3])[^>]*>([\s\S]*?)<\/h\1>/gi)) {
+    const level = Number(m[1]);
+    const text = decodeHtmlEntities(m[2].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim());
+    if (text) headers.push({ level, text });
+  }
+
+  const paragraphs = [];
+  for (const m of html.matchAll(/<p[^>]*>([\s\S]*?)<\/p>/gi)) {
+    const text = decodeHtmlEntities(m[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim());
+    if (text.length > 10) paragraphs.push(text);
+  }
+
+  const list_items = [];
+  for (const m of html.matchAll(/<li[^>]*>([\s\S]*?)<\/li>/gi)) {
+    const text = decodeHtmlEntities(m[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim());
+    if (text.length > 3) list_items.push(text);
+  }
+
+  const code_snippets = [];
+  for (const m of html.matchAll(/<pre[^>]*>([\s\S]*?)<\/pre>/gi)) {
+    const text = decodeHtmlEntities(m[1].replace(/<[^>]+>/g, '').trim());
+    if (text.length > 10) code_snippets.push(text);
+  }
+
+  const raw_text = decodeHtmlEntities(
+    html
+      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+      .replace(/<nav[^>]*>[\s\S]*?<\/nav>/gi, '')
+      .replace(/<footer[^>]*>[\s\S]*?<\/footer>/gi, '')
+      .replace(/<header[^>]*>[\s\S]*?<\/header>/gi, '')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+  );
+
+  return { title, description, headers, paragraphs, list_items, code_snippets, raw_text };
+}
+
+function formatGuideMarkdown(name, page) {
+  let output = `# ${page.title || name}\n\n`;
+  output += `**URL:** ${page.url || "N/A"}\n\n`;
+
+  if (page.description) {
+    output += `## Overview\n${page.description}\n\n`;
+  }
+
+  if (page.headers?.length > 0) {
+    output += `## Table of Contents\n`;
+    output += page.headers.map(h => `${"  ".repeat(h.level - 1)}- ${h.text}`).join("\n");
+    output += "\n\n";
+  }
+
+  if (page.paragraphs?.length > 0) {
+    output += `## Content\n`;
+    output += page.paragraphs.join("\n\n");
+    output += "\n\n";
+  }
+
+  if (page.list_items?.length > 0) {
+    output += `## Key Points\n`;
+    output += page.list_items.map(li => `- ${li}`).join("\n");
+    output += "\n\n";
+  }
+
+  if (page.code_snippets?.length > 0) {
+    output += `## Code Examples\n\`\`\`\n`;
+    output += page.code_snippets.join("\n");
+    output += "\n```\n\n";
+  }
+
+  output += `## Full Content\n${page.raw_text || "No additional content."}`;
+  return output;
+}
+
+function formatEndpointMarkdown(endpointName, endpoint) {
+  const curlExample =
+    endpoint.curl_example ||
+    `curl --request ${endpoint.method || 'GET'} \\\n  --url https://api.twitterapi.io${endpoint.path || ''} \\\n  --header 'x-api-key: YOUR_API_KEY'`;
+
+  return `# ${endpoint.title || endpointName}
+
+## Endpoint Details
+- **Method:** ${endpoint.method || "GET"}
+- **Path:** ${endpoint.path || "Unknown"}
+- **Full URL:** https://api.twitterapi.io${endpoint.path || ""}
+- **Documentation:** ${endpoint.url}
+
+## Description
+${endpoint.description || "No description available."}
+
+${endpoint.parameters?.length > 0 ? `## Parameters
+${endpoint.parameters.map(p => `- **${p.name}**${p.required ? ' (required)' : ''}: ${p.description}`).join('\n')}` : ''}
+
+## cURL Example
+\`\`\`bash
+${curlExample}
+\`\`\`
+
+${endpoint.code_snippets?.length > 0 ? `## Code Examples
+\`\`\`
+${endpoint.code_snippets.join("\n")}
+\`\`\`` : ""}
+
+## Full Documentation
+${endpoint.raw_text || "No additional content available."}`;
+}
+
+function safeCanonicalizeUrl(url) {
+  try {
+    return canonicalizeUrl(url);
+  } catch (_err) {
+    return null;
+  }
+}
+
+function findSnapshotItemByUrl(data, canonicalUrl) {
+  for (const [name, ep] of Object.entries(data.endpoints || {})) {
+    const epUrl = safeCanonicalizeUrl(ep?.url);
+    if (epUrl && epUrl === canonicalUrl) {
+      return { kind: 'endpoint', name, item: ep };
+    }
+  }
+
+  for (const [name, page] of Object.entries(data.pages || {})) {
+    const pageUrl = safeCanonicalizeUrl(page?.url);
+    if (pageUrl && pageUrl === canonicalUrl) {
+      return { kind: 'page', name, item: page };
+    }
+  }
+
+  for (const [name, blog] of Object.entries(data.blogs || {})) {
+    const blogUrl = safeCanonicalizeUrl(blog?.url);
+    if (blogUrl && blogUrl === canonicalUrl) {
+      return { kind: 'blog', name, item: blog };
+    }
+  }
+
+  return null;
+}
+
 // ========== MCP SERVER ==========
 const server = new Server(
   {
     name: "twitterapi-docs",
-    version: "1.0.4",
+    version: "1.0.5",
   },
   {
     capabilities: {
@@ -891,8 +1134,12 @@ const server = new Server(
 );
 
 // ========== TOOL DEFINITIONS (LLM-OPTIMIZED) ==========
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
+server.setRequestHandler(ListToolsRequestSchema, async () => {
+  const docs = loadDocs();
+  const availablePages = Object.keys(docs.pages || {}).sort();
+
+  return {
+    tools: [
     {
       name: "search_twitterapi_docs",
       description: `Search TwitterAPI.io documentation: API endpoints, guides (pricing, rate limits, filter rules), and blog posts.
@@ -927,20 +1174,39 @@ Examples:
       outputSchema: {
         type: "object",
         properties: {
-          content: {
+          query: { type: "string", description: "Normalized (trimmed) search query." },
+          max_results: { type: "integer", description: "Applied max results (1-20)." },
+          cached: { type: "boolean", description: "Whether this response was served from cache." },
+	          counts: {
+	            type: "object",
+	            properties: {
+	              total: { type: "integer" },
+	              endpoints: { type: "integer" },
+	              pages: { type: "integer" },
+	              blogs: { type: "integer" }
+	            }
+	          },
+          results: {
             type: "array",
             items: {
               type: "object",
               properties: {
-                type: { type: "string", enum: ["text"] },
-                text: {
-                  type: "string",
-                  description: "Markdown formatted search results with sections: API Endpoints (name, method, path, description), Guides (name, title, url), Blog Posts (title, url)"
-                }
-              }
+                type: { type: "string", enum: ["endpoint", "page", "blog"] },
+                name: { type: "string" },
+                title: { type: "string" },
+                description: { type: "string" },
+                url: { type: "string" },
+                category: { type: "string" },
+                method: { type: "string" },
+                path: { type: "string" },
+                score: { type: "number" }
+              },
+              required: ["type", "score"]
             }
-          }
-        }
+          },
+          markdown: { type: "string", description: "Human-readable markdown rendering of the results." }
+        },
+        required: ["query", "max_results", "results", "markdown"]
       }
     },
     {
@@ -967,20 +1233,32 @@ Common endpoints:
       outputSchema: {
         type: "object",
         properties: {
-          content: {
+          endpoint_name: { type: "string" },
+          title: { type: "string" },
+          method: { type: "string" },
+          path: { type: "string" },
+          full_url: { type: "string" },
+          doc_url: { type: "string" },
+          description: { type: "string" },
+          parameters: {
             type: "array",
             items: {
               type: "object",
               properties: {
-                type: { type: "string", enum: ["text"] },
-                text: {
-                  type: "string",
-                  description: "Markdown with: Title, Endpoint Details (method, path, full URL, doc link), Description, Parameters list (name, required, description), cURL Example, Code Examples, Full Documentation"
-                }
-              }
+                name: { type: "string" },
+                required: { type: "boolean" },
+                description: { type: "string" }
+              },
+              required: ["name"]
             }
-          }
-        }
+          },
+          curl_example: { type: "string" },
+          code_snippets: { type: "array", items: { type: "string" } },
+          raw_text: { type: "string" },
+          cached: { type: "boolean" },
+          markdown: { type: "string" }
+        },
+        required: ["endpoint_name", "markdown"]
       }
     },
     {
@@ -996,36 +1274,41 @@ RETURNS: Endpoint names with HTTP method and path for each category.`,
         properties: {
           category: {
             type: "string",
-            description: "Optional filter: user, tweet, community, webhook, stream, action, dm, list, trend",
-            enum: ["user", "tweet", "community", "webhook", "stream", "action", "dm", "list", "trend"]
+            description: "Optional filter: user, tweet, community, webhook, stream, action, dm, list, trend, other",
+            enum: ["user", "tweet", "community", "webhook", "stream", "action", "dm", "list", "trend", "other"]
           },
         },
       },
       outputSchema: {
         type: "object",
         properties: {
-          content: {
+          category: { type: ["string", "null"] },
+          total: { type: "integer" },
+          endpoints: {
             type: "array",
             items: {
               type: "object",
               properties: {
-                type: { type: "string", enum: ["text"] },
-                text: {
-                  type: "string",
-                  description: "Markdown list organized by category (USER, TWEET, WEBHOOK, etc.) with endpoint format: name: METHOD /path"
-                }
-              }
+                name: { type: "string" },
+                method: { type: "string" },
+                path: { type: "string" },
+                description: { type: "string" },
+                category: { type: "string" }
+              },
+              required: ["name", "category"]
             }
-          }
-        }
+          },
+          markdown: { type: "string" }
+        },
+        required: ["total", "endpoints", "markdown"]
       }
     },
     {
       name: "get_twitterapi_guide",
-      description: `Get TwitterAPI.io guide pages for conceptual topics.
+      description: `Get a TwitterAPI.io page from the offline snapshot by page key.
 
-USE THIS WHEN: You need information about pricing, rate limits, authentication, or filter rules.
-AVAILABLE GUIDES: pricing, qps_limits, tweet_filter_rules, changelog, introduction, authentication, readme
+USE THIS WHEN: You need the full content of a specific page (guides, docs, policies, contact, etc.).
+TIP: Use search_twitterapi_docs if you don't know the page key.
 
 RETURNS: Full guide content with headers, paragraphs, and code examples.`,
       inputSchema: {
@@ -1033,8 +1316,8 @@ RETURNS: Full guide content with headers, paragraphs, and code examples.`,
         properties: {
           guide_name: {
             type: "string",
-            description: "Guide name: pricing, qps_limits, tweet_filter_rules, changelog, introduction, authentication, readme",
-            enum: ["pricing", "qps_limits", "tweet_filter_rules", "changelog", "introduction", "authentication", "readme"]
+            description: "Page key (from data/pages). Examples: pricing, qps_limits, privacy, contact, introduction, authentication.",
+            enum: availablePages
           },
         },
         required: ["guide_name"],
@@ -1042,20 +1325,63 @@ RETURNS: Full guide content with headers, paragraphs, and code examples.`,
       outputSchema: {
         type: "object",
         properties: {
-          content: {
+          guide_name: { type: "string" },
+          title: { type: "string" },
+          url: { type: "string" },
+          description: { type: "string" },
+          headers: {
             type: "array",
             items: {
               type: "object",
               properties: {
-                type: { type: "string", enum: ["text"] },
-                text: {
-                  type: "string",
-                  description: "Markdown with: Title, URL, Overview, Table of Contents, Content paragraphs, Key Points list, Code Examples, Full Content"
-                }
-              }
+                level: { type: "integer" },
+                text: { type: "string" }
+              },
+              required: ["level", "text"]
             }
+          },
+          paragraphs: { type: "array", items: { type: "string" } },
+          list_items: { type: "array", items: { type: "string" } },
+          code_snippets: { type: "array", items: { type: "string" } },
+          raw_text: { type: "string" },
+          markdown: { type: "string" }
+        },
+        required: ["guide_name", "markdown"]
+      }
+    },
+    {
+      name: "get_twitterapi_url",
+      description: `Fetch a TwitterAPI.io or docs.twitterapi.io URL.
+
+USE THIS WHEN: You have a specific link and want its full content.
+RETURNS: Parsed content from the offline snapshot. If not found, you can set fetch_live=true (restricted to twitterapi.io/docs.twitterapi.io).`,
+      inputSchema: {
+        type: "object",
+        properties: {
+          url: {
+            type: "string",
+            description: "URL to fetch. Examples: https://twitterapi.io/privacy, /pricing, docs.twitterapi.io/introduction"
+          },
+          fetch_live: {
+            type: "boolean",
+            description: "If true and the URL is missing from the offline snapshot, fetch it live over HTTPS (allowed hosts only).",
+            default: false
           }
-        }
+        },
+        required: ["url"]
+      },
+      outputSchema: {
+        type: "object",
+        properties: {
+          url: { type: "string" },
+          source: { type: "string", enum: ["snapshot", "live"] },
+          kind: { type: "string", enum: ["endpoint", "page", "blog"] },
+          name: { type: "string" },
+          title: { type: "string" },
+          description: { type: "string" },
+          markdown: { type: "string" }
+        },
+        required: ["url", "source", "kind", "name", "markdown"]
       }
     },
     {
@@ -1071,20 +1397,20 @@ RETURNS: Pricing tiers, credit costs per endpoint, QPS limits by balance level.`
       outputSchema: {
         type: "object",
         properties: {
-          content: {
-            type: "array",
-            items: {
-              type: "object",
-              properties: {
-                type: { type: "string", enum: ["text"] },
-                text: {
-                  type: "string",
-                  description: "Markdown with: Credit System (USD to credits), Endpoint Costs table, Minimum Charge, QPS Limits by balance level, Important Notes, Cost Comparison"
-                }
-              }
+          credits_per_usd: { type: "number" },
+          minimum_charge: { type: "string" },
+          costs: { type: "object", additionalProperties: { type: "string" } },
+          qps_limits: {
+            type: "object",
+            properties: {
+              free: { type: "string" },
+              paid: { type: "object", additionalProperties: { type: "string" } }
             }
-          }
-        }
+          },
+          notes: { type: "array", items: { type: "string" } },
+          markdown: { type: "string" }
+        },
+        required: ["markdown"]
       }
     },
     {
@@ -1100,28 +1426,30 @@ RETURNS: API key header format, base URL, cURL/Python/JavaScript examples.`,
       outputSchema: {
         type: "object",
         properties: {
-          content: {
-            type: "array",
-            items: {
-              type: "object",
-              properties: {
-                type: { type: "string", enum: ["text"] },
-                text: {
-                  type: "string",
-                  description: "Markdown with: API Key Usage header name, Base URL, Getting Your API Key steps, Request Examples (cURL, Python, JavaScript code blocks)"
-                }
-              }
+          header: { type: "string" },
+          base_url: { type: "string" },
+          dashboard_url: { type: "string" },
+          examples: {
+            type: "object",
+            properties: {
+              curl: { type: "string" },
+              python: { type: "string" },
+              javascript: { type: "string" }
             }
-          }
-        }
+          },
+          markdown: { type: "string" }
+        },
+        required: ["header", "base_url", "markdown"]
       }
     },
-  ],
-}));
+    ],
+  };
+});
 
 // ========== TOOL HANDLERS ==========
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
+  const { name } = request.params;
+  const args = request.params.arguments ?? {};
   const startTime = Date.now();
   let success = true;
 
@@ -1165,14 +1493,26 @@ async function handleToolCall(name, args) {
       const cachedOutput = searchCache.get(cacheKey);
       if (cachedOutput) {
         logger.info('search', 'Cache hit', { query: validation.value, maxResults });
-        return formatToolSuccess(cachedOutput + '\n\n*[Cached result]*');
+        const cachedMarkdown = typeof cachedOutput === 'string' ? cachedOutput : cachedOutput.markdown;
+        const markdown = `${cachedMarkdown}\n\n*[Cached result]*`;
+        const structuredContent = typeof cachedOutput === 'string'
+          ? {
+            query: validation.value,
+            max_results: maxResults,
+            cached: true,
+            counts: { total: 0, endpoints: 0, pages: 0, blogs: 0 },
+            results: [],
+            markdown
+          }
+          : { ...cachedOutput, cached: true, markdown };
+        return formatToolSuccess(markdown, structuredContent);
       }
 
       const results = searchInDocs(validation.value, maxResults);
 
       if (results.length === 0) {
         const allEndpoints = Object.keys(data.endpoints || {}).slice(0, 15);
-        return formatToolSuccess(`No results for "${validation.value}".
+        const markdown = `No results for "${validation.value}".
 
 **Suggestions:**
 - Try different terms: "search", "user", "tweet", "webhook", "stream"
@@ -1182,8 +1522,16 @@ async function handleToolCall(name, args) {
 **Available endpoints (sample):**
 ${allEndpoints.map(e => `- ${e}`).join('\n')}
 
-**Guide pages:**
-- pricing, qps_limits, tweet_filter_rules, changelog, authentication`);
+**Pages:**
+- pricing, qps_limits, tweet_filter_rules, changelog, authentication`;
+        return formatToolSuccess(markdown, {
+          query: validation.value,
+          max_results: maxResults,
+          cached: false,
+          counts: { total: 0, endpoints: 0, pages: 0, blogs: 0 },
+          results: [],
+          markdown
+        });
       }
 
       const grouped = {
@@ -1203,7 +1551,7 @@ ${allEndpoints.map(e => `- ${e}`).join('\n')}
       }
 
       if (grouped.page.length > 0) {
-        output += `### Guides (${grouped.page.length})\n`;
+        output += `### Pages (${grouped.page.length})\n`;
         output += grouped.page.slice(0, 10).map((r, i) =>
           `${i + 1}. **${r.name}** - ${r.title || ""}\n   ${r.url || ""}`
         ).join("\n\n");
@@ -1218,9 +1566,22 @@ ${allEndpoints.map(e => `- ${e}`).join('\n')}
       }
 
       // Cache the result
-      searchCache.set(cacheKey, output);
+      const structuredContent = {
+        query: validation.value,
+        max_results: maxResults,
+        cached: false,
+        counts: {
+          total: results.length,
+          endpoints: grouped.endpoint.length,
+          pages: grouped.page.length,
+          blogs: grouped.blog.length
+        },
+        results,
+        markdown: output
+      };
+      searchCache.set(cacheKey, structuredContent);
 
-      return formatToolSuccess(output);
+      return formatToolSuccess(output, structuredContent);
     }
 
     case "get_twitterapi_endpoint": {
@@ -1235,7 +1596,15 @@ ${allEndpoints.map(e => `- ${e}`).join('\n')}
       const cachedOutput = endpointCache.get(cacheKey);
       if (cachedOutput) {
         logger.info('endpoint', 'Cache hit', { endpoint: validation.value });
-        return formatToolSuccess(cachedOutput);
+        if (typeof cachedOutput === 'string') {
+          return formatToolSuccess(cachedOutput, {
+            endpoint_name: validation.value,
+            cached: true,
+            markdown: cachedOutput
+          });
+        }
+
+        return formatToolSuccess(cachedOutput.markdown, { ...cachedOutput, cached: true });
       }
 
       const endpoint = data.endpoints?.[validation.value];
@@ -1256,6 +1625,12 @@ ${allEndpoints.map(e => `- ${e}`).join('\n')}
         });
       }
 
+      const curlExample =
+        endpoint.curl_example ||
+        `curl --request ${endpoint.method || 'GET'} \\
+  --url https://api.twitterapi.io${endpoint.path || ''} \\
+  --header 'x-api-key: YOUR_API_KEY'`;
+
       const info = `# ${endpoint.title || validation.value}
 
 ## Endpoint Details
@@ -1272,9 +1647,7 @@ ${endpoint.parameters.map(p => `- **${p.name}**${p.required ? ' (required)' : ''
 
 ## cURL Example
 \`\`\`bash
-${endpoint.curl_example || `curl --request ${endpoint.method || 'GET'} \\
-  --url https://api.twitterapi.io${endpoint.path || ''} \\
-  --header 'x-api-key: YOUR_API_KEY'`}
+${curlExample}
 \`\`\`
 
 ${endpoint.code_snippets?.length > 0 ? `## Code Examples
@@ -1286,9 +1659,24 @@ ${endpoint.code_snippets.join("\n")}
 ${endpoint.raw_text || "No additional content available."}`;
 
       // Cache the result
-      endpointCache.set(cacheKey, info);
+      const structuredContent = {
+        endpoint_name: validation.value,
+        title: endpoint.title || validation.value,
+        method: endpoint.method || "GET",
+        path: endpoint.path || "",
+        full_url: `https://api.twitterapi.io${endpoint.path || ""}`,
+        doc_url: endpoint.url || "",
+        description: endpoint.description || "",
+        parameters: endpoint.parameters || [],
+        curl_example: curlExample,
+        code_snippets: endpoint.code_snippets || [],
+        raw_text: endpoint.raw_text || "",
+        cached: false,
+        markdown: info
+      };
+      endpointCache.set(cacheKey, structuredContent);
 
-      return formatToolSuccess(info);
+      return formatToolSuccess(info, structuredContent);
     }
 
     case "list_twitterapi_endpoints": {
@@ -1329,11 +1717,30 @@ ${endpoint.raw_text || "No additional content available."}`;
         }
       }
 
-      if (validation.value && categories[validation.value]) {
-        const filtered = categories[validation.value];
-        return formatToolSuccess(`## ${validation.value.toUpperCase()} Endpoints (${filtered.length})
+      const allStructured = [];
+      for (const [cat, eps] of Object.entries(categories)) {
+        for (const ep of eps) {
+          allStructured.push({
+            name: ep.name,
+            method: ep.method || "GET",
+            path: ep.path || "",
+            description: ep.description || "",
+            category: cat
+          });
+        }
+      }
 
-${filtered.map((e) => `- **${e.name}**: ${e.method || "GET"} ${e.path || ""}\n  ${e.description || ""}`).join("\n\n")}`);
+      if (validation.value && categories[validation.value]) {
+        const filtered = allStructured.filter((e) => e.category === validation.value);
+        const markdown = `## ${validation.value.toUpperCase()} Endpoints (${filtered.length})
+
+${filtered.map((e) => `- **${e.name}**: ${e.method} ${e.path}\n  ${e.description}`).join("\n\n")}`;
+        return formatToolSuccess(markdown, {
+          category: validation.value,
+          total: endpoints.length,
+          endpoints: filtered,
+          markdown
+        });
       }
 
       let output = `# TwitterAPI.io Endpoints (Total: ${endpoints.length})\n\n`;
@@ -1344,12 +1751,17 @@ ${filtered.map((e) => `- **${e.name}**: ${e.method || "GET"} ${e.path || ""}\n  
           output += "\n\n";
         }
       }
-      return formatToolSuccess(output);
+      return formatToolSuccess(output, {
+        category: null,
+        total: endpoints.length,
+        endpoints: allStructured,
+        markdown: output
+      });
     }
 
     case "get_twitterapi_guide": {
       // Validate input
-      const validation = validateGuideName(args.guide_name);
+      const validation = validateGuideName(args.guide_name, Object.keys(data.pages || {}));
       if (!validation.valid) {
         return formatToolError(validation.error);
       }
@@ -1365,47 +1777,147 @@ ${filtered.map((e) => `- **${e.name}**: ${e.method || "GET"} ${e.path || ""}\n  
         });
       }
 
-      let output = `# ${page.title || validation.value}\n\n`;
-      output += `**URL:** ${page.url || "N/A"}\n\n`;
+      const output = formatGuideMarkdown(validation.value, page);
 
-      if (page.description) {
-        output += `## Overview\n${page.description}\n\n`;
+      return formatToolSuccess(output, {
+        guide_name: validation.value,
+        title: page.title || validation.value,
+        url: page.url || "",
+        description: page.description || "",
+        headers: page.headers || [],
+        paragraphs: page.paragraphs || [],
+        list_items: page.list_items || [],
+        code_snippets: page.code_snippets || [],
+        raw_text: page.raw_text || "",
+        markdown: output
+      });
+    }
+
+    case "get_twitterapi_url": {
+      const validation = validateTwitterApiUrl(args.url);
+      if (!validation.valid) {
+        return formatToolError(validation.error);
       }
 
-      if (page.headers?.length > 0) {
-        output += `## Table of Contents\n`;
-        output += page.headers.map(h => `${"  ".repeat(h.level - 1)}- ${h.text}`).join("\n");
-        output += "\n\n";
+      const canonicalUrl = validation.value;
+      const fetchLive = Boolean(args.fetch_live);
+
+      const snapshotCacheKey = `url_snapshot_${canonicalUrl}`;
+      const cachedSnapshot = urlCache.get(snapshotCacheKey);
+      if (cachedSnapshot) {
+        const markdown = `${cachedSnapshot.markdown}\n\n*[Cached result]*`;
+        return formatToolSuccess(markdown, { ...cachedSnapshot, markdown });
       }
 
-      if (page.paragraphs?.length > 0) {
-        output += `## Content\n`;
-        output += page.paragraphs.join("\n\n");
-        output += "\n\n";
+      const match = findSnapshotItemByUrl(data, canonicalUrl);
+      if (match) {
+        const markdown = match.kind === 'endpoint'
+          ? formatEndpointMarkdown(match.name, match.item)
+          : formatGuideMarkdown(match.name, match.item);
+
+        const structuredContent = {
+          url: canonicalUrl,
+          source: 'snapshot',
+          kind: match.kind,
+          name: match.name,
+          title: match.item?.title || match.name,
+          description: match.item?.description || '',
+          markdown
+        };
+
+        urlCache.set(snapshotCacheKey, structuredContent);
+        return formatToolSuccess(markdown, structuredContent);
       }
 
-      if (page.list_items?.length > 0) {
-        output += `## Key Points\n`;
-        output += page.list_items.map(li => `- ${li}`).join("\n");
-        output += "\n\n";
+      if (!fetchLive) {
+        return formatToolError({
+          type: ErrorType.NOT_FOUND,
+          message: `URL not found in offline snapshot: ${canonicalUrl}`,
+          suggestion: 'Run `npm run scrape` to refresh `data/docs.json`, or call again with { fetch_live: true }',
+          retryable: false
+        });
       }
 
-      if (page.code_snippets?.length > 0) {
-        output += `## Code Examples\n\`\`\`\n`;
-        output += page.code_snippets.join("\n");
-        output += "\n```\n\n";
+      const liveCacheKey = `url_live_${canonicalUrl}`;
+      const cachedLive = urlCache.get(liveCacheKey);
+      if (cachedLive) {
+        const markdown = `${cachedLive.markdown}\n\n*[Cached result]*`;
+        return formatToolSuccess(markdown, { ...cachedLive, markdown });
       }
 
-      output += `## Full Content\n${page.raw_text || "No additional content."}`;
+      try {
+        const response = await fetch(canonicalUrl, { redirect: 'follow' });
+        if (!response.ok) {
+          return formatToolError({
+            type: ErrorType.NOT_FOUND,
+            message: `Failed to fetch URL (${response.status}): ${canonicalUrl}`,
+            suggestion: 'Check that the URL is correct and accessible',
+            retryable: response.status >= 500
+          });
+        }
 
-      return formatToolSuccess(output);
+        const html = await response.text();
+        const extracted = extractHtmlContent(html);
+        const parsed = new URL(canonicalUrl);
+
+        let kind = 'page';
+        let name = 'page';
+
+        if (parsed.hostname === 'docs.twitterapi.io' && parsed.pathname.includes('/api-reference/endpoint/')) {
+          const slug = parsed.pathname.split('/api-reference/endpoint/')[1]?.replace(/\/+$/g, '');
+          if (slug) {
+            kind = 'endpoint';
+            name = slug;
+          }
+        } else if (parsed.hostname === 'twitterapi.io' && parsed.pathname.startsWith('/blog/')) {
+          const slug = parsed.pathname.replace(/^\/blog\//, '');
+          kind = 'blog';
+          name = `blog_${normalizeKeyForName(slug)}`;
+        } else if (parsed.pathname === '/') {
+          name = 'home';
+        } else {
+          name = normalizeKeyForName(parsed.pathname.replace(/^\/+|\/+$/g, '').replace(/\//g, '_'));
+        }
+
+        const page = { ...extracted, url: canonicalUrl };
+        const markdown = formatGuideMarkdown(name, page);
+
+        const structuredContent = {
+          url: canonicalUrl,
+          source: 'live',
+          kind,
+          name,
+          title: extracted.title || name,
+          description: extracted.description || '',
+          markdown
+        };
+
+        urlCache.set(liveCacheKey, structuredContent);
+        return formatToolSuccess(markdown, structuredContent);
+      } catch (error) {
+        logger.error('url_fetch', `Failed to fetch URL: ${canonicalUrl}`, error);
+        return formatToolError({
+          type: ErrorType.TIMEOUT,
+          message: 'Failed to fetch URL',
+          suggestion: 'Try again, or run `npm run scrape` to include this page in the offline snapshot',
+          retryable: true
+        });
+      }
     }
 
     case "get_twitterapi_pricing": {
       const pricing = data.pricing || {};
       const qps = data.qps_limits || {};
 
-      return formatToolSuccess(`# TwitterAPI.io Pricing
+      const notes = [
+        'Credits never expire',
+        'Bonus credits valid for 30 days',
+        'Up to 5% discount on bulk purchases',
+        'List endpoints: 150 credits/request',
+        '~97% cheaper than official Twitter API'
+      ];
+
+      const markdown = `# TwitterAPI.io Pricing
 
 ## Credit System
 - **1 USD = ${pricing.credits_per_usd?.toLocaleString() || "100,000"} Credits**
@@ -1433,22 +1945,46 @@ ${Object.entries(qps.paid || {}).map(([k, v]) => `- **${k.replace(/_/g, " ")}**:
 ## Cost Comparison
 TwitterAPI.io is **~97% cheaper** than official Twitter API.
 - Twitter Pro: $5,000/month
-- TwitterAPI.io equivalent: ~$150/month`);
+- TwitterAPI.io equivalent: ~$150/month`;
+
+      return formatToolSuccess(markdown, {
+        credits_per_usd: pricing.credits_per_usd || 100000,
+        minimum_charge: pricing.minimum_charge || "15 credits ($0.00015) per request",
+        costs: pricing.costs || {},
+        qps_limits: {
+          free: qps.free || "1 request per 5 seconds",
+          paid: qps.paid || {}
+        },
+        notes,
+        markdown
+      });
     }
 
     case "get_twitterapi_auth": {
       const auth = data.authentication || {};
 
-      return formatToolSuccess(`# TwitterAPI.io Authentication
+      const header = auth.header || "x-api-key";
+      const baseUrl = auth.base_url || "https://api.twitterapi.io";
+      const dashboardUrl = auth.dashboard_url || "https://twitterapi.io/dashboard";
+
+      const examples = {
+        curl: `curl -X GET "${baseUrl}/twitter/user/info?userName=elonmusk" \\\n  -H "${header}: YOUR_API_KEY"`,
+        python:
+          `import requests\n\nresponse = requests.get(\n    "${baseUrl}/twitter/user/info",\n    params={"userName": "elonmusk"},\n    headers={"${header}": "YOUR_API_KEY"}\n)\nprint(response.json())`,
+        javascript:
+          `const response = await fetch(\n  "${baseUrl}/twitter/user/info?userName=elonmusk",\n  { headers: { "${header}": "YOUR_API_KEY" } }\n);\nconst data = await response.json();`
+      };
+
+      const markdown = `# TwitterAPI.io Authentication
 
 ## API Key Usage
-All requests require the \`${auth.header || "x-api-key"}\` header.
+All requests require the \`${header}\` header.
 
 ## Base URL
-\`${auth.base_url || "https://api.twitterapi.io"}\`
+\`${baseUrl}\`
 
 ## Getting Your API Key
-1. Go to ${auth.dashboard_url || "https://twitterapi.io/dashboard"}
+1. Go to ${dashboardUrl}
 2. Sign up / Log in
 3. Copy your API key from the dashboard
 
@@ -1456,37 +1992,33 @@ All requests require the \`${auth.header || "x-api-key"}\` header.
 
 ### cURL
 \`\`\`bash
-curl -X GET "${auth.base_url || "https://api.twitterapi.io"}/twitter/user/info?userName=elonmusk" \\
-  -H "${auth.header || "x-api-key"}: YOUR_API_KEY"
+${examples.curl}
 \`\`\`
 
 ### Python
 \`\`\`python
-import requests
-
-response = requests.get(
-    "${auth.base_url || "https://api.twitterapi.io"}/twitter/user/info",
-    params={"userName": "elonmusk"},
-    headers={"${auth.header || "x-api-key"}": "YOUR_API_KEY"}
-)
-print(response.json())
+${examples.python}
 \`\`\`
 
 ### JavaScript
 \`\`\`javascript
-const response = await fetch(
-  "${auth.base_url || "https://api.twitterapi.io"}/twitter/user/info?userName=elonmusk",
-  { headers: { "${auth.header || "x-api-key"}": "YOUR_API_KEY" } }
-);
-const data = await response.json();
-\`\`\``);
+${examples.javascript}
+\`\`\``;
+
+      return formatToolSuccess(markdown, {
+        header,
+        base_url: baseUrl,
+        dashboard_url: dashboardUrl,
+        examples,
+        markdown
+      });
     }
 
     default:
       return formatToolError({
         type: ErrorType.NOT_FOUND,
         message: `Unknown tool: ${name}`,
-        suggestion: 'Available tools: search_twitterapi_docs, get_twitterapi_endpoint, list_twitterapi_endpoints, get_twitterapi_guide, get_twitterapi_pricing, get_twitterapi_auth',
+        suggestion: 'Available tools: search_twitterapi_docs, get_twitterapi_endpoint, list_twitterapi_endpoints, get_twitterapi_guide, get_twitterapi_url, get_twitterapi_pricing, get_twitterapi_auth',
         retryable: false
       });
   }
@@ -1507,6 +2039,12 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => ({
       mimeType: "application/json",
       name: "API Endpoint List",
       description: "Summary of all API endpoints",
+    },
+    {
+      uri: "twitterapi://endpoints/list",
+      mimeType: "application/json",
+      name: "API Endpoints (Alias)",
+      description: "Alias of twitterapi://docs/endpoints",
     },
     {
       uri: "twitterapi://docs/guides",
@@ -1534,10 +2072,40 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => ({
       description: "QPS limits by balance level",
     },
     {
+      uri: "twitterapi://guides/qps-limits",
+      mimeType: "text/markdown",
+      name: "Rate Limits Guide (Alias)",
+      description: "Alias of twitterapi://guides/qps_limits",
+    },
+    {
       uri: "twitterapi://guides/tweet_filter_rules",
       mimeType: "text/markdown",
       name: "Tweet Filter Rules",
       description: "Advanced search filter syntax",
+    },
+    {
+      uri: "twitterapi://guides/filter-rules",
+      mimeType: "text/markdown",
+      name: "Tweet Filter Rules (Alias)",
+      description: "Alias of twitterapi://guides/tweet_filter_rules",
+    },
+    {
+      uri: "twitterapi://guides/changelog",
+      mimeType: "text/markdown",
+      name: "Changelog",
+      description: "API changelog",
+    },
+    {
+      uri: "twitterapi://guides/introduction",
+      mimeType: "text/markdown",
+      name: "Introduction",
+      description: "Overview of TwitterAPI.io",
+    },
+    {
+      uri: "twitterapi://guides/readme",
+      mimeType: "text/markdown",
+      name: "README",
+      description: "Project overview and usage",
     },
     // Monitoring resources
     {
@@ -1551,6 +2119,12 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => ({
       mimeType: "application/json",
       name: "Health Check",
       description: "Server health status and data freshness",
+    },
+    {
+      uri: "twitterapi://status/freshness",
+      mimeType: "application/json",
+      name: "Data Freshness",
+      description: "Last docs update time and freshness status",
     },
   ],
 }));
@@ -1570,7 +2144,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
     };
   }
 
-  if (uri === "twitterapi://docs/endpoints") {
+  if (uri === "twitterapi://docs/endpoints" || uri === "twitterapi://endpoints/list") {
     const summary = Object.entries(data.endpoints || {}).map(([name, ep]) => ({
       name,
       method: ep.method,
@@ -1646,7 +2220,7 @@ curl -X GET "${auth.base_url || "https://api.twitterapi.io"}/twitter/user/info?u
     };
   }
 
-  if (uri === "twitterapi://guides/qps_limits") {
+  if (uri === "twitterapi://guides/qps_limits" || uri === "twitterapi://guides/qps-limits") {
     const qps = data.qps_limits || {};
     return {
       contents: [{
@@ -1663,7 +2237,7 @@ ${Object.entries(qps.paid || {}).map(([k, v]) => `- **${k.replace(/_/g, " ")}**:
     };
   }
 
-  if (uri === "twitterapi://guides/tweet_filter_rules") {
+  if (uri === "twitterapi://guides/tweet_filter_rules" || uri === "twitterapi://guides/filter-rules") {
     const page = data.pages?.tweet_filter_rules || {};
     return {
       contents: [{
@@ -1672,6 +2246,45 @@ ${Object.entries(qps.paid || {}).map(([k, v]) => `- **${k.replace(/_/g, " ")}**:
         text: `# Tweet Filter Rules
 
 ${page.raw_text || page.description || "Filter rules documentation not available."}`,
+      }],
+    };
+  }
+
+  if (uri === "twitterapi://guides/changelog") {
+    const page = data.pages?.changelog || {};
+    return {
+      contents: [{
+        uri,
+        mimeType: "text/markdown",
+        text: `# ${page.title || "Changelog"}
+
+${page.raw_text || page.description || "Changelog not available."}`,
+      }],
+    };
+  }
+
+  if (uri === "twitterapi://guides/introduction") {
+    const page = data.pages?.introduction || {};
+    return {
+      contents: [{
+        uri,
+        mimeType: "text/markdown",
+        text: `# ${page.title || "Introduction"}
+
+${page.raw_text || page.description || "Introduction not available."}`,
+      }],
+    };
+  }
+
+  if (uri === "twitterapi://guides/readme") {
+    const page = data.pages?.readme || {};
+    return {
+      contents: [{
+        uri,
+        mimeType: "text/markdown",
+        text: `# ${page.title || "README"}
+
+${page.raw_text || page.description || "README not available."}`,
       }],
     };
   }
@@ -1696,7 +2309,8 @@ ${page.raw_text || page.description || "Filter rules documentation not available
       dataFreshness: freshness,
       cache: {
         search: searchCache.stats(),
-        endpoints: endpointCache.stats()
+        endpoints: endpointCache.stats(),
+        urls: urlCache.stats()
       },
       sloStatus: {
         violations: logger.metrics.sloViolations,
@@ -1708,6 +2322,16 @@ ${page.raw_text || page.description || "Filter rules documentation not available
         uri,
         mimeType: "application/json",
         text: JSON.stringify(health, null, 2),
+      }],
+    };
+  }
+
+  if (uri === "twitterapi://status/freshness") {
+    return {
+      contents: [{
+        uri,
+        mimeType: "application/json",
+        text: JSON.stringify(getDataFreshness(), null, 2),
       }],
     };
   }
@@ -1731,7 +2355,7 @@ server.setRequestHandler(CompleteRequestSchema, async () => {
 // ========== SERVER STARTUP ==========
 async function main() {
   try {
-    logger.info('init', 'Starting TwitterAPI.io Docs MCP Server v1.0.3');
+    logger.info('init', 'Starting TwitterAPI.io Docs MCP Server v1.0.5');
 
     // Validate docs file exists
     if (!fs.existsSync(DOCS_PATH)) {
@@ -1766,8 +2390,16 @@ async function main() {
     await server.connect(transport);
 
     logger.info('init', 'MCP Server ready on stdio', {
-      version: '1.0.3',
-      features: ['max_results', 'camelCase', 'SLO tracking', 'MCP Resources', 'data freshness', 'trusted publishing']
+      version: '1.0.5',
+      features: [
+        'offline snapshot',
+        'endpoints + pages + blogs',
+        'get_twitterapi_url (optional live fetch)',
+        'structuredContent outputs',
+        'MCP Resources',
+        'data freshness',
+        'trusted publishing'
+      ]
     });
 
     // Graceful shutdown

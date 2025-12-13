@@ -8,6 +8,8 @@ import { describe, it, before } from 'node:test';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DOCS_PATH = path.join(__dirname, '..', 'data', 'docs.json');
@@ -545,6 +547,42 @@ describe('Cache Key Normalization', () => {
   it('should handle search queries', () => {
     const key = normalizeKey('search_user info webhook');
     assert.strictEqual(key, 'search_user_info_webhook');
+  });
+});
+
+describe('MCP Protocol Integration', () => {
+  it('should return structuredContent for tools with outputSchema', async () => {
+    const repoRoot = path.join(__dirname, '..');
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [path.join(repoRoot, 'index.js')],
+      cwd: repoRoot,
+      stderr: 'pipe',
+    });
+
+    const client = new Client({ name: 'twitterapi-docs-mcp-tests', version: '0.0.0' });
+
+    try {
+      await client.connect(transport);
+
+      const tools = await client.listTools();
+      assert.ok(tools.tools.some(t => t.name === 'get_twitterapi_pricing'));
+
+      const pricing = await client.callTool({ name: 'get_twitterapi_pricing', arguments: {} });
+      assert.ok(pricing.structuredContent, 'Expected structuredContent in tool result');
+      assert.strictEqual(typeof pricing.structuredContent.markdown, 'string');
+
+      const page = await client.callTool({
+        name: 'get_twitterapi_url',
+        arguments: { url: 'https://twitterapi.io/pricing' }
+      });
+      assert.ok(page.structuredContent, 'Expected structuredContent in URL tool result');
+      assert.strictEqual(page.structuredContent.kind, 'page');
+      assert.strictEqual(page.structuredContent.name, 'pricing');
+      assert.strictEqual(typeof page.structuredContent.markdown, 'string');
+    } finally {
+      await client.close();
+    }
   });
 });
 

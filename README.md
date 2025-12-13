@@ -21,8 +21,8 @@ I'm sharing this with the community because if it helped me, it might help you t
 ## Features
 
 - **52 API endpoints** documented
-- **8 guide pages** (pricing, QPS limits, filter rules, changelog, etc.)
-- **5 blog articles** (pricing comparison, analytics guide, etc.)
+- **Site + docs pages** via sitemap (pricing, QPS limits, privacy, contact, changelog, etc.)
+- **Blog posts** via blog index crawl
 - **Offline-first** - Works without network access
 - **Fast search** with fuzzy matching and camelCase support
 - **Hybrid caching** for optimal performance
@@ -69,7 +69,8 @@ claude mcp list
 | `search_twitterapi_docs` | Full-text search across all docs (endpoints, guides, blogs) |
 | `get_twitterapi_endpoint` | Get detailed info for a specific API endpoint |
 | `list_twitterapi_endpoints` | List all endpoints with optional category filter |
-| `get_twitterapi_guide` | Get guide pages (pricing, qps_limits, authentication, etc.) |
+| `get_twitterapi_guide` | Get a page by key (guides + other site/docs pages) |
+| `get_twitterapi_url` | Fetch a specific `twitterapi.io` / `docs.twitterapi.io` URL (snapshot, optional live fetch) |
 | `get_twitterapi_pricing` | Quick access to pricing information |
 | `get_twitterapi_auth` | Quick access to authentication guide |
 
