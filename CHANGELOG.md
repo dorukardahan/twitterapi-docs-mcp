@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.6] - 2025-12-13
+
+### Added
+- Internal link crawling in `scrape-all.cjs` to capture non-sitemap pages (e.g., `terms`, `acceptable_use`, `dashboard`)
+- URL conveniences in `get_twitterapi_url`: accepts page keys (e.g., `qps_limits`) and bare paths (e.g., `pricing`)
+- Offline aliases for common docs redirects (`https://docs.twitterapi.io/`, `/api-reference`)
+
+### Changed
+- Improved HTML extraction in the scraper to handle nested tags more reliably
+- Updated bundled snapshot (`data/docs.json`) to include more site pages and blog posts
+
+### Fixed
+- Scraper now fails fast on HTTP 4xx/5xx instead of saving error pages
+
+---
+
 ## [1.0.5] - 2025-12-13
 
 ### Added

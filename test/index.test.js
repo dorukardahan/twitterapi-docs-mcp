@@ -511,6 +511,15 @@ describe('Documentation Data', () => {
     assert.ok(docs.pages.authentication);
   });
 
+  it('should have legal pages', () => {
+    assert.ok(docs.pages.terms, 'Terms page missing');
+    assert.ok(docs.pages.acceptable_use, 'Acceptable Use page missing');
+  });
+
+  it('should have dashboard page', () => {
+    assert.ok(docs.pages.dashboard, 'Dashboard page missing');
+  });
+
   it('endpoints should have required fields', () => {
     for (const [name, endpoint] of Object.entries(docs.endpoints)) {
       assert.ok(endpoint.url, `Endpoint ${name} missing url`);
@@ -580,6 +589,36 @@ describe('MCP Protocol Integration', () => {
       assert.strictEqual(page.structuredContent.kind, 'page');
       assert.strictEqual(page.structuredContent.name, 'pricing');
       assert.strictEqual(typeof page.structuredContent.markdown, 'string');
+
+      const keyLookup = await client.callTool({
+        name: 'get_twitterapi_url',
+        arguments: { url: 'qps_limits' }
+      });
+      assert.ok(keyLookup.structuredContent, 'Expected structuredContent for key-based lookup');
+      assert.strictEqual(keyLookup.structuredContent.kind, 'page');
+      assert.strictEqual(keyLookup.structuredContent.name, 'qps_limits');
+
+      const docsRoot = await client.callTool({
+        name: 'get_twitterapi_url',
+        arguments: { url: 'https://docs.twitterapi.io/' }
+      });
+      assert.ok(docsRoot.structuredContent, 'Expected structuredContent for docs root alias');
+      assert.strictEqual(docsRoot.structuredContent.kind, 'page');
+      assert.strictEqual(docsRoot.structuredContent.name, 'introduction');
+
+      const apiRef = await client.callTool({
+        name: 'get_twitterapi_url',
+        arguments: { url: 'https://docs.twitterapi.io/api-reference' }
+      });
+      assert.ok(apiRef.structuredContent, 'Expected structuredContent for api-reference alias');
+      assert.strictEqual(apiRef.structuredContent.kind, 'page');
+      assert.strictEqual(apiRef.structuredContent.name, 'docs_api_reference');
+
+      const badHost = await client.callTool({
+        name: 'get_twitterapi_url',
+        arguments: { url: 'https://example.com/' }
+      });
+      assert.strictEqual(badHost.isError, true);
     } finally {
       await client.close();
     }

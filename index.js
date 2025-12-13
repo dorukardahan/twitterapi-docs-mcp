@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * TwitterAPI.io Documentation MCP Server v1.0.5
+ * TwitterAPI.io Documentation MCP Server v1.0.6
  *
  * Production-ready MCP server with:
  * - Comprehensive error handling with ErrorType classification
@@ -618,8 +618,11 @@ function canonicalizeUrl(rawUrl) {
   let candidate = trimmed;
   if (candidate.startsWith('/')) {
     candidate = `https://twitterapi.io${candidate}`;
-  } else if (/^(twitterapi\.io|docs\.twitterapi\.io)\//i.test(candidate)) {
+  } else if (/^(twitterapi\.io|docs\.twitterapi\.io)(?:$|[/?#])/i.test(candidate)) {
     candidate = `https://${candidate}`;
+  } else if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(candidate)) {
+    // Allow convenient inputs like "pricing" or "qps-limits"
+    candidate = `https://twitterapi.io/${candidate}`;
   }
 
   const u = new URL(candidate);
@@ -1122,7 +1125,7 @@ function findSnapshotItemByUrl(data, canonicalUrl) {
 const server = new Server(
   {
     name: "twitterapi-docs",
-    version: "1.0.5",
+    version: "1.0.6",
   },
   {
     capabilities: {
@@ -1794,29 +1797,59 @@ ${filtered.map((e) => `- **${e.name}**: ${e.method} ${e.path}\n  ${e.description
     }
 
     case "get_twitterapi_url": {
-      const validation = validateTwitterApiUrl(args.url);
+      const rawInput = typeof args.url === 'string' ? args.url.trim() : args.url;
+      const keyCandidate = typeof rawInput === 'string' ? rawInput.toLowerCase() : null;
+      const resolvedInput = keyCandidate && (data.pages?.[keyCandidate]?.url || data.endpoints?.[keyCandidate]?.url)
+        ? (data.pages?.[keyCandidate]?.url || data.endpoints?.[keyCandidate]?.url)
+        : args.url;
+
+      const validation = validateTwitterApiUrl(resolvedInput);
       if (!validation.valid) {
         return formatToolError(validation.error);
       }
 
-      const canonicalUrl = validation.value;
+      const requestedUrl = validation.value;
       const fetchLive = Boolean(args.fetch_live);
 
-      const snapshotCacheKey = `url_snapshot_${canonicalUrl}`;
+      const snapshotCacheKey = `url_snapshot_${requestedUrl}`;
       const cachedSnapshot = urlCache.get(snapshotCacheKey);
       if (cachedSnapshot) {
         const markdown = `${cachedSnapshot.markdown}\n\n*[Cached result]*`;
         return formatToolSuccess(markdown, { ...cachedSnapshot, markdown });
       }
 
-      const match = findSnapshotItemByUrl(data, canonicalUrl);
+      // Offline aliases for common redirect routes on docs.twitterapi.io
+      let lookupUrl = requestedUrl;
+
+      if (lookupUrl === 'https://docs.twitterapi.io/') {
+        const introUrl = safeCanonicalizeUrl(data.pages?.introduction?.url) || 'https://docs.twitterapi.io/introduction';
+        lookupUrl = introUrl;
+      }
+
+      if (lookupUrl === 'https://docs.twitterapi.io/api-reference' || lookupUrl === 'https://docs.twitterapi.io/api-reference/endpoint') {
+        const listResult = await handleToolCall('list_twitterapi_endpoints', {});
+        const markdown = listResult?.structuredContent?.markdown || listResult?.content?.[0]?.text || '# API Reference';
+        const structuredContent = {
+          url: requestedUrl,
+          source: 'snapshot',
+          kind: 'page',
+          name: 'docs_api_reference',
+          title: 'TwitterAPI.io API Reference',
+          description: 'Index of available endpoints',
+          markdown
+        };
+        urlCache.set(snapshotCacheKey, structuredContent);
+        return formatToolSuccess(markdown, structuredContent);
+      }
+
+      const match = findSnapshotItemByUrl(data, lookupUrl);
       if (match) {
         const markdown = match.kind === 'endpoint'
           ? formatEndpointMarkdown(match.name, match.item)
           : formatGuideMarkdown(match.name, match.item);
 
         const structuredContent = {
-          url: canonicalUrl,
+          url: requestedUrl,
           source: 'snapshot',
           kind: match.kind,
           name: match.name,
@@ -1832,13 +1865,13 @@ ${filtered.map((e) => `- **${e.name}**: ${e.method} ${e.path}\n  ${e.description
       if (!fetchLive) {
         return formatToolError({
           type: ErrorType.NOT_FOUND,
-          message: `URL not found in offline snapshot: ${canonicalUrl}`,
+          message: `URL not found in offline snapshot: ${requestedUrl}`,
           suggestion: 'Run `npm run scrape` to refresh `data/docs.json`, or call again with { fetch_live: true }',
           retryable: false
         });
       }
 
-      const liveCacheKey = `url_live_${canonicalUrl}`;
+      const liveCacheKey = `url_live_${requestedUrl}`;
       const cachedLive = urlCache.get(liveCacheKey);
       if (cachedLive) {
         const markdown = `${cachedLive.markdown}\n\n*[Cached result]*`;
@@ -1846,11 +1879,11 @@ ${filtered.map((e) => `- **${e.name}**: ${e.method} ${e.path}\n  ${e.description
       }
 
       try {
-        const response = await fetch(canonicalUrl, { redirect: 'follow' });
+        const response = await fetch(requestedUrl, { redirect: 'follow' });
         if (!response.ok) {
           return formatToolError({
             type: ErrorType.NOT_FOUND,
-            message: `Failed to fetch URL (${response.status}): ${canonicalUrl}`,
+            message: `Failed to fetch URL (${response.status}): ${requestedUrl}`,
             suggestion: 'Check that the URL is correct and accessible',
             retryable: response.status >= 500
           });
@@ -1858,7 +1891,7 @@ ${filtered.map((e) => `- **${e.name}**: ${e.method} ${e.path}\n  ${e.description
 
         const html = await response.text();
         const extracted = extractHtmlContent(html);
-        const parsed = new URL(canonicalUrl);
+        const parsed = new URL(requestedUrl);
 
         let kind = 'page';
         let name = 'page';
@@ -1879,11 +1912,11 @@ ${filtered.map((e) => `- **${e.name}**: ${e.method} ${e.path}\n  ${e.description
           name = normalizeKeyForName(parsed.pathname.replace(/^\/+|\/+$/g, '').replace(/\//g, '_'));
         }
 
-        const page = { ...extracted, url: canonicalUrl };
+        const page = { ...extracted, url: requestedUrl };
         const markdown = formatGuideMarkdown(name, page);
 
         const structuredContent = {
-          url: canonicalUrl,
+          url: requestedUrl,
           source: 'live',
           kind,
           name,
@@ -1895,7 +1928,7 @@ ${filtered.map((e) => `- **${e.name}**: ${e.method} ${e.path}\n  ${e.description
         urlCache.set(liveCacheKey, structuredContent);
         return formatToolSuccess(markdown, structuredContent);
       } catch (error) {
-        logger.error('url_fetch', `Failed to fetch URL: ${canonicalUrl}`, error);
+        logger.error('url_fetch', `Failed to fetch URL: ${requestedUrl}`, error);
         return formatToolError({
           type: ErrorType.TIMEOUT,
           message: 'Failed to fetch URL',
@@ -2355,7 +2388,7 @@ server.setRequestHandler(CompleteRequestSchema, async () => {
 // ========== SERVER STARTUP ==========
 async function main() {
   try {
-    logger.info('init', 'Starting TwitterAPI.io Docs MCP Server v1.0.5');
+    logger.info('init', 'Starting TwitterAPI.io Docs MCP Server v1.0.6');
 
     // Validate docs file exists
     if (!fs.existsSync(DOCS_PATH)) {
@@ -2390,7 +2423,7 @@ async function main() {
     await server.connect(transport);
 
     logger.info('init', 'MCP Server ready on stdio', {
-      version: '1.0.5',
+      version: '1.0.6',
       features: [
         'offline snapshot',
         'endpoints + pages + blogs',

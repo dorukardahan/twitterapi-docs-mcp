@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 /**
- * TwitterAPI.io Complete Documentation Scraper v2.1
+ * TwitterAPI.io Complete Documentation Scraper v2.2
  * Düzeltmeler:
  * - Path extraction bug fix (cURL'den doğru path çıkarma)
  * - İçerik truncation kaldırıldı
  * - Daha iyi parameter parsing
- * - Sitemap + blog index ile otomatik link keşfi
+ * - Sitemap + internal link crawl ile otomatik link keşfi
  */
 
 const https = require('https');
@@ -16,6 +16,18 @@ const SITE_SITEMAP_URL = 'https://twitterapi.io/sitemap.xml';
 const BLOG_INDEX_URL = 'https://twitterapi.io/blog/';
 const DOCS_SITEMAP_URL = 'https://docs.twitterapi.io/sitemap.xml';
 const DOCS_ENDPOINT_PREFIX = 'https://docs.twitterapi.io/api-reference/endpoint/';
+
+const ALLOWED_HOSTS = new Set(['twitterapi.io', 'docs.twitterapi.io']);
+
+const ASSET_EXTENSIONS = new Set([
+  'css', 'js', 'mjs', 'cjs', 'map',
+  'png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'ico',
+  'woff', 'woff2', 'ttf', 'eot',
+  'pdf', 'zip', 'gz', 'tgz',
+  'xml', 'json'
+]);
+
+const MAX_INTERNAL_CRAWL_PAGES = 250;
 
 const GUIDE_PAGE_KEYS = new Set([
   'pricing',
@@ -45,6 +57,10 @@ function fetchPage(url) {
         const redirectedUrl = new URL(res.headers.location, url).toString();
         return fetchPage(redirectedUrl).then(resolve).catch(reject);
       }
+      if (res.statusCode >= 400) {
+        res.resume();
+        return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
+      }
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => resolve(data));
@@ -62,7 +78,8 @@ function decodeHtmlEntities(text) {
     .replace(/&amp;/g, '&')
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
-    .replace(/&#39;/g, "'");
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, ' ');
 }
 
 function extractSitemapLocs(xml) {
@@ -84,11 +101,28 @@ function stripSlashes(value) {
 }
 
 function pageKeyFromUrl(url) {
-  const { pathname } = new URL(url);
-  const clean = stripSlashes(pathname);
-  if (!clean) return 'home';
-  if (clean === 'blog') return 'blog_index';
-  return normalizeKey(clean.replace(/\//g, '_'));
+  const parsed = new URL(url);
+  const clean = stripSlashes(parsed.pathname);
+
+  // Root pages
+  if (!clean) {
+    return parsed.hostname === 'docs.twitterapi.io' ? 'docs_home' : 'home';
+  }
+
+  // Site blog index
+  if (parsed.hostname === 'twitterapi.io' && clean === 'blog') {
+    return 'blog_index';
+  }
+
+  const baseKey = normalizeKey(clean.replace(/\//g, '_'));
+
+  // Avoid key collisions between site and docs pages
+  if (parsed.hostname === 'docs.twitterapi.io') {
+    if (baseKey === 'authentication' || baseKey === 'introduction') return baseKey;
+    return `docs_${baseKey}`;
+  }
+
+  return baseKey;
 }
 
 function blogKeyFromUrl(url) {
@@ -110,13 +144,87 @@ function categoryForPageKey(key, host) {
   return 'info';
 }
 
+function canonicalizeUrlForScrape(rawUrl, baseUrl = null) {
+  const value = (rawUrl || '').trim();
+  if (!value) return null;
+  if (value.startsWith('#')) return null;
+  if (/^(mailto:|tel:|javascript:|data:)/i.test(value)) return null;
+
+  let parsed;
+  try {
+    parsed = baseUrl ? new URL(value, baseUrl) : new URL(value);
+  } catch (_err) {
+    return null;
+  }
+
+  if (parsed.protocol === 'http:') parsed.protocol = 'https:';
+  if (parsed.protocol !== 'https:') return null;
+  if (!ALLOWED_HOSTS.has(parsed.hostname)) return null;
+
+  parsed.hash = '';
+  parsed.search = '';
+  if (parsed.pathname !== '/' && parsed.pathname.endsWith('/')) {
+    parsed.pathname = parsed.pathname.slice(0, -1);
+  }
+  return parsed.toString();
+}
+
+function isLikelyHtmlUrl(url) {
+  try {
+    const parsed = new URL(url);
+    const pathname = parsed.pathname.toLowerCase();
+
+    if (pathname.includes('/_next/')) return false;
+    if (pathname === '/favicon.ico') return false;
+    if (parsed.hostname === 'twitterapi.io' && (pathname === '/api' || pathname.startsWith('/api/'))) return false;
+
+    const extMatch = pathname.match(/\.([a-z0-9]+)$/);
+    if (extMatch && ASSET_EXTENSIONS.has(extMatch[1])) return false;
+
+    return true;
+  } catch (_err) {
+    return false;
+  }
+}
+
+function stripTags(fragment) {
+  return decodeHtmlEntities(
+    fragment
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+  );
+}
+
+function stripTagsPreserveWhitespace(fragment) {
+  return decodeHtmlEntities(
+    fragment
+      .replace(/<[^>]+>/g, '')
+      .replace(/\r/g, '')
+      .trim()
+  );
+}
+
+function discoverInternalLinksFromHtml(html, baseUrl) {
+  const urls = new Set();
+  const matches = html.matchAll(/href\s*=\s*["']([^"']+)["']/gi);
+  for (const m of matches) {
+    const canonical = canonicalizeUrlForScrape(m[1], baseUrl);
+    if (!canonical) continue;
+    if (!isLikelyHtmlUrl(canonical)) continue;
+    urls.add(canonical);
+  }
+  return [...urls];
+}
+
 function discoverBlogUrlsFromIndex(html) {
   const urls = new Set();
   const matches = html.matchAll(/href=["'](\/blog\/[^"'?#]+)\/?["']/gi);
   for (const m of matches) {
     const path = m[1].replace(/\/+$/g, '');
     if (path === '/blog') continue;
-    urls.add(`https://twitterapi.io${path}`);
+    const canonical = canonicalizeUrlForScrape(`https://twitterapi.io${path}`);
+    if (canonical) urls.add(canonical);
   }
   return [...urls];
 }
@@ -124,7 +232,11 @@ function discoverBlogUrlsFromIndex(html) {
 async function discoverScrapeTargets() {
   // twitterapi.io (marketing + blog)
   const siteXml = await fetchPage(SITE_SITEMAP_URL);
-  const siteUrls = new Set(extractSitemapLocs(siteXml));
+  const siteUrls = new Set(
+    extractSitemapLocs(siteXml)
+      .map((u) => canonicalizeUrlForScrape(u))
+      .filter(Boolean)
+  );
 
   // Blog index often contains more posts than sitemap
   try {
@@ -138,19 +250,76 @@ async function discoverScrapeTargets() {
 
   // Ensure legacy/known posts remain included even if not discoverable
   for (const slug of BLOG_KEY_OVERRIDES.keys()) {
-    siteUrls.add(`https://twitterapi.io/blog/${slug}`);
+    const canonical = canonicalizeUrlForScrape(`https://twitterapi.io/blog/${slug}`);
+    if (canonical) siteUrls.add(canonical);
   }
 
   const sitePages = [];
   const siteBlogs = [];
+
+  // docs.twitterapi.io (API reference + docs pages)
+  const docsXml = await fetchPage(DOCS_SITEMAP_URL);
+  const docsUrls = new Set(
+    extractSitemapLocs(docsXml)
+      .map((u) => canonicalizeUrlForScrape(u))
+      .filter(Boolean)
+  );
+
+  // Crawl internal links to expand coverage beyond sitemap
+  const discoveryQueue = [];
+  const visited = new Set();
+
+  // Seed discovery with non-endpoint pages only (avoid double-fetching all endpoints)
+  for (const u of siteUrls) {
+    if (isLikelyHtmlUrl(u)) discoveryQueue.push(u);
+  }
+  for (const u of docsUrls) {
+    if (u.startsWith(DOCS_ENDPOINT_PREFIX)) continue;
+    if (isLikelyHtmlUrl(u)) discoveryQueue.push(u);
+  }
+
+  while (discoveryQueue.length > 0 && visited.size < MAX_INTERNAL_CRAWL_PAGES) {
+    const current = discoveryQueue.shift();
+    if (!current || visited.has(current)) continue;
+    visited.add(current);
+
+    let html;
+    try {
+      html = await fetchPage(current);
+    } catch (_err) {
+      continue;
+    }
+
+    for (const link of discoverInternalLinksFromHtml(html, current)) {
+      if (visited.has(link)) continue;
+
+      const parsed = new URL(link);
+      if (parsed.hostname === 'docs.twitterapi.io' && parsed.pathname === '/') continue;
+      if (parsed.hostname === 'twitterapi.io') {
+        siteUrls.add(link);
+      } else if (parsed.hostname === 'docs.twitterapi.io') {
+        docsUrls.add(link);
+      }
+
+      // Avoid crawling endpoint pages (already covered by sitemap)
+      if (link.startsWith(DOCS_ENDPOINT_PREFIX)) continue;
+
+      // Avoid crawling blog posts deeply; the blog index is the source of truth
+      if (parsed.hostname === 'twitterapi.io' && parsed.pathname.startsWith('/blog/') && parsed.pathname !== '/blog') {
+        continue;
+      }
+
+      if (discoveryQueue.length + visited.size >= MAX_INTERNAL_CRAWL_PAGES) continue;
+      discoveryQueue.push(link);
+    }
+  }
+
+  // Build final categorized lists after discovery
   for (const u of siteUrls) {
     const parsed = new URL(u);
     if (parsed.hostname !== 'twitterapi.io') continue;
 
-    const isBlogPost = parsed.pathname.startsWith('/blog/')
-      && parsed.pathname !== '/blog/'
-      && parsed.pathname !== '/blog';
-
+    const isBlogPost = parsed.pathname.startsWith('/blog/') && parsed.pathname !== '/blog';
     if (isBlogPost) {
       const name = blogKeyFromUrl(u);
       siteBlogs.push({ url: u, name, category: 'blog' });
@@ -160,17 +329,15 @@ async function discoverScrapeTargets() {
     }
   }
 
-  // docs.twitterapi.io (API reference + docs pages)
-  const docsXml = await fetchPage(DOCS_SITEMAP_URL);
-  const docsUrls = extractSitemapLocs(docsXml);
-
-  const endpoints = [];
+  const endpoints = new Set();
   const docsPages = [];
   for (const u of docsUrls) {
     if (!u.startsWith('https://docs.twitterapi.io/')) continue;
+    const parsed = new URL(u);
+    if (parsed.pathname === '/') continue;
     if (u.startsWith(DOCS_ENDPOINT_PREFIX)) {
       const slug = u.slice(DOCS_ENDPOINT_PREFIX.length).replace(/\/+$/g, '');
-      if (slug) endpoints.push(slug);
+      if (slug) endpoints.add(slug);
     } else {
       const name = pageKeyFromUrl(u);
       docsPages.push({ url: u, name, category: 'docs' });
@@ -181,9 +348,9 @@ async function discoverScrapeTargets() {
   sitePages.sort((a, b) => a.name.localeCompare(b.name));
   siteBlogs.sort((a, b) => a.name.localeCompare(b.name));
   docsPages.sort((a, b) => a.name.localeCompare(b.name));
-  endpoints.sort();
+  const endpointsSorted = [...endpoints].sort();
 
-  return { sitePages, siteBlogs, docsPages, endpoints };
+  return { sitePages, siteBlogs, docsPages, endpoints: endpointsSorted };
 }
 
 function extractMainSiteContent(html, pageName) {
@@ -203,43 +370,34 @@ function extractMainSiteContent(html, pageName) {
 
   // H1, H2, H3 headers
   const headers = [];
-  const h1Match = html.matchAll(/<h1[^>]*>([^<]+)<\/h1>/gi);
-  for (const m of h1Match) headers.push({ level: 1, text: decodeHtmlEntities(m[1].trim()) });
-  const h2Match = html.matchAll(/<h2[^>]*>([^<]+)<\/h2>/gi);
-  for (const m of h2Match) headers.push({ level: 2, text: decodeHtmlEntities(m[1].trim()) });
-  const h3Match = html.matchAll(/<h3[^>]*>([^<]+)<\/h3>/gi);
-  for (const m of h3Match) headers.push({ level: 3, text: decodeHtmlEntities(m[1].trim()) });
+  for (const m of html.matchAll(/<h([1-3])[^>]*>([\s\S]*?)<\/h\1>/gi)) {
+    const level = Number(m[1]);
+    const text = stripTags(m[2]);
+    if (text) headers.push({ level, text });
+  }
   if (headers.length) result.headers = headers;
 
   // Paragraphs - TÜM paragrafları al
   const paragraphs = [];
-  const pMatch = html.matchAll(/<p[^>]*>([^<]+)<\/p>/gi);
-  for (const m of pMatch) {
-    const text = decodeHtmlEntities(m[1].trim());
+  for (const m of html.matchAll(/<p[^>]*>([\s\S]*?)<\/p>/gi)) {
+    const text = stripTags(m[1]);
     if (text.length > 10) paragraphs.push(text);
   }
   if (paragraphs.length) result.paragraphs = paragraphs; // Limit kaldırıldı
 
-  // Code blocks - TÜM code bloklarını al
-  const codeBlocks = [];
-  const codeMatch = html.matchAll(/<code[^>]*>([^<]+)<\/code>/gi);
-  for (const m of codeMatch) codeBlocks.push(decodeHtmlEntities(m[1]));
-  if (codeBlocks.length) result.code_snippets = codeBlocks; // Limit kaldırıldı
-
   // Pre blocks (büyük kod blokları)
   const preBlocks = [];
-  const preMatch = html.matchAll(/<pre[^>]*>([\s\S]*?)<\/pre>/gi);
-  for (const m of preMatch) {
-    const text = m[1].replace(/<[^>]+>/g, '').trim();
-    if (text.length > 10) preBlocks.push(decodeHtmlEntities(text));
+  for (const m of html.matchAll(/<pre[^>]*>([\s\S]*?)<\/pre>/gi)) {
+    const text = stripTagsPreserveWhitespace(m[1]);
+    if (text.length > 10) preBlocks.push(text);
   }
   if (preBlocks.length) result.pre_blocks = preBlocks;
+  if (preBlocks.length) result.code_snippets = preBlocks;
 
   // Lists (li items) - TÜM list itemları al
   const listItems = [];
-  const liMatch = html.matchAll(/<li[^>]*>([^<]+)<\/li>/gi);
-  for (const m of liMatch) {
-    const text = decodeHtmlEntities(m[1].trim());
+  for (const m of html.matchAll(/<li[^>]*>([\s\S]*?)<\/li>/gi)) {
+    const text = stripTags(m[1]);
     if (text.length > 3) listItems.push(text);
   }
   if (listItems.length) result.list_items = listItems; // Limit kaldırıldı
@@ -365,22 +523,26 @@ function extractEndpointContent(html, endpointName) {
     if (responseFields.length) result.response_fields = responseFields.slice(0, 50);
   }
 
-  // Code blocks - TÜM code bloklarını al
-  const codeBlocks = [];
-  const codeMatch = html.matchAll(/<code[^>]*>([^<]+)<\/code>/gi);
-  for (const m of codeMatch) {
-    const code = decodeHtmlEntities(m[1]);
-    if (code.length > 5) codeBlocks.push(code);
+  // Code blocks: prefer <pre> blocks (Mintlify code examples)
+  const preBlocks = [];
+  for (const m of html.matchAll(/<pre[^>]*>([\s\S]*?)<\/pre>/gi)) {
+    const text = stripTagsPreserveWhitespace(m[1]);
+    if (text.length > 10) preBlocks.push(text);
   }
-  if (codeBlocks.length) result.code_snippets = codeBlocks;
+  if (preBlocks.length) result.code_snippets = preBlocks;
 
   // cURL örneğini ayrıca sakla
-  const curlExample = html.match(/curl\s+--request[^<]+/i);
-  if (curlExample) {
-    result.curl_example = decodeHtmlEntities(curlExample[0]
-      .replace(/\\n/g, '\n')
-      .replace(/\s+/g, ' ')
-      .trim());
+  const curlFromPre = preBlocks.find((s) => /curl\s+--request/i.test(s));
+  if (curlFromPre) {
+    result.curl_example = curlFromPre.replace(/\s+\n/g, '\n').trim();
+  } else {
+    const curlExample = html.match(/curl\s+--request[^<]+/i);
+    if (curlExample) {
+      result.curl_example = decodeHtmlEntities(curlExample[0]
+        .replace(/\\n/g, '\n')
+        .replace(/\s+/g, ' ')
+        .trim());
+    }
   }
 
   // Raw text - TAM içerik, truncation YOK
@@ -395,7 +557,7 @@ function extractEndpointContent(html, endpointName) {
 }
 
 async function scrapeAll() {
-  console.log('🚀 TwitterAPI.io v2.1 Scraper - Tüm içerikler çekiliyor...\n');
+  console.log('🚀 TwitterAPI.io v2.2 Scraper - Tüm içerikler çekiliyor...\n');
 
   console.log('🔎 Link keşfi (sitemap + blog index)...\n');
   const targets = await discoverScrapeTargets();
@@ -408,7 +570,7 @@ async function scrapeAll() {
     meta: {
       source: 'https://twitterapi.io + https://docs.twitterapi.io',
       scraped_at: new Date().toISOString(),
-      version: '2.1',
+      version: '2.2',
       total_endpoints: endpointsToScrape.length,
       total_pages: pagesToScrape.length,
       total_blogs: blogsToScrape.length
@@ -492,6 +654,12 @@ async function scrapeAll() {
 
   const outPath = path.join(__dirname, 'data', 'docs.json');
   fs.mkdirSync(path.dirname(outPath), { recursive: true });
+
+  // Ensure meta counts reflect successful scrapes
+  docs.meta.total_endpoints = Object.keys(docs.endpoints).length;
+  docs.meta.total_pages = Object.keys(docs.pages).length;
+  docs.meta.total_blogs = Object.keys(docs.blogs).length;
+
   fs.writeFileSync(outPath, JSON.stringify(docs, null, 2));
 
   const stats = {
@@ -501,7 +669,7 @@ async function scrapeAll() {
   };
 
   console.log(`
-✅ Scraping tamamlandı! (v2.1)
+✅ Scraping tamamlandı! (v2.2)
    - ${stats.endpoints} endpoint
    - ${stats.pages} sayfa
    - ${stats.blogs} blog yazısı
